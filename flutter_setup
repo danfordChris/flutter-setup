@@ -1,0 +1,314 @@
+# Flutter Setup Script – Full Documentation
+
+## Overview
+
+`flutter_setup` is a global CLI script that automatically creates a fully structured Flutter project with:
+
+- Clean architecture folder structure
+- Pre-installed dependencies
+- Pre-configured Makefile
+- Localization setup
+- Theme setup
+- Extension utilities
+- Code generator template
+- Asset directories
+- Feature-based modular structure
+
+This script saves hours of manual setup and enforces consistency across projects.
+
+---
+
+# Installation (Global Usage)
+
+## 1️⃣ Move Script to Global Location
+
+Rename your script to `flutter_setup` and move it to a global binary directory:
+
+```bash
+sudo mv flutter_setup /usr/local/bin/flutter_setup
+```
+
+---
+
+## 2️⃣ Make It Executable
+
+```bash
+sudo chmod +x /usr/local/bin/flutter_setup
+```
+
+---
+
+## 3️⃣ Test Installation
+
+Run from anywhere:
+
+```bash
+flutter_setup my_app
+```
+
+This will create a new Flutter project named `my_app` in your current directory.
+
+---
+
+# What the Script Does
+
+When you run:
+
+```bash
+flutter_setup my_app
+```
+
+The script performs the following steps:
+
+---
+
+## 1. Creates Flutter Project
+
+```bash
+flutter create my_app
+```
+
+---
+
+## 2. Installs Required Packages
+
+Automatically installs:
+
+- `go_router`
+- `flutter_pack`
+
+Then runs:
+
+```bash
+flutter pub get
+```
+
+---
+
+## 3. Generates Folder Structure
+
+```
+lib/
+├── core/
+│   ├── constants/
+│   ├── extensions/
+│   ├── mixins/
+│   ├── resources/
+│   ├── theme/
+│   └── utils/
+├── dao/
+├── features/
+├── l10n/
+├── root/
+├── services/
+└── shared/
+    ├── components/
+    └── controllers/
+```
+
+Also creates:
+
+```
+assets/
+├── fonts/
+├── images/
+└── svgs/
+```
+
+---
+
+## 4. Creates Preconfigured Files
+
+### Extensions
+
+`BuildContextExtension` for:
+
+- Theme access
+- Color scheme
+- Text styles
+- MediaQuery width/height
+- GoRouter state access
+
+---
+
+### Theme System
+
+- `AppTheme`
+- `CustomColors`
+- Material 3 enabled
+
+---
+
+### Localization
+
+ARB files included:
+
+- English
+- Arabic
+- Spanish
+- French
+- Swahili
+
+---
+
+### Splash Screen
+
+Basic splash screen template inside:
+
+```
+lib/root/splash_screen.dart
+```
+
+---
+
+### Resource Exports
+
+- Fonts
+- Images
+- SVGs
+
+---
+
+### Code Generator
+
+Automatically generates:
+
+```dart
+import 'package:flutter_pack/flutter_pack.dart';
+
+void main() {
+  List<BaseModelGenerator> generator = [];
+  CodeGenerator.of('your_project_name', generator).generate();
+}
+```
+
+The project name is dynamically injected.
+
+---
+
+### Makefile Included
+
+Preconfigured commands:
+
+| Command | Description |
+|----------|-------------|
+| make help | Show all commands |
+| make run | Run app |
+| make clean | Clean project |
+| make get | Get dependencies |
+| make upgrade | Upgrade packages |
+| make apk | Build release APK |
+| make apk_debug | Build debug APK |
+| make feature name=auth | Generate feature structure |
+| make test | Run tests |
+| make analyze | Analyze code |
+| make format | Format code |
+| make coverage | Test with coverage |
+| make doctor | Run flutter doctor |
+
+---
+
+# Creating a Feature
+
+Example:
+
+```bash
+make feature name=auth
+```
+
+Creates:
+
+```
+lib/features/auth/
+├── controllers/
+├── services/
+├── models/
+├── screens/
+└── widgets/
+```
+
+---
+
+# Recommended Workflow
+
+After project creation:
+
+```bash
+cd my_app
+make setup
+make feature name=auth
+make run
+```
+
+---
+
+# Requirements
+
+- Flutter SDK (latest stable)
+- Dart SDK
+- Make installed (Mac/Linux default)
+
+---
+
+# Updating the Script
+
+If you update the script:
+
+```bash
+sudo mv flutter_setup /usr/local/bin/flutter_setup
+sudo chmod +x /usr/local/bin/flutter_setup
+```
+
+---
+
+# Troubleshooting
+
+## Permission Denied
+
+Run:
+
+```bash
+chmod +x flutter_setup
+```
+
+## Command Not Found
+
+Ensure `/usr/local/bin` is in your PATH:
+
+```bash
+echo $PATH
+```
+
+If missing, add to `.zshrc`:
+
+```bash
+export PATH="/usr/local/bin:$PATH"
+source ~/.zshrc
+```
+
+---
+
+# Why Use This Script?
+
+- Enforces consistent architecture
+- Saves setup time
+- Pre-configured generator system
+- Production-ready base structure
+- Clean scalable modular design
+- Automated dependency installation
+
+---
+
+# Future Improvements (Optional)
+
+- Versioning system
+- CLI flags (e.g. --riverpod, --bloc)
+- Auto CI/CD template
+- Docker setup
+- Firebase preset option
+
+---
+
+# License
+
+Add your preferred license here.
