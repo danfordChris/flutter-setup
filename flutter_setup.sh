@@ -29,6 +29,33 @@ flutter pub add go_router
 flutter pub add flutter_pack
 flutter pub get
 
+echo "Adding dotenv support..."
+flutter pub add flutter_dotenv
+
+echo "Injecting assets into existing flutter section..."
+
+awk '
+/uses-material-design: true/ && !x {
+    print;
+    print "";
+    print "  assets:";
+    print "    - assets/images/";
+    print "    - assets/svgs/";
+    print "    - assets/fonts/";
+    print "    - .env";
+    x=1;
+    next
+}
+{print}
+' pubspec.yaml > pubspec.tmp && mv pubspec.tmp pubspec.yaml
+
+echo "Updating pubspec.yaml with flutter_intl..."
+cat >> pubspec.yaml << 'EOF'
+
+flutter_intl:
+  enabled: true
+EOF
+
 echo ""
 echo "Creating folder structure..."
 
@@ -314,6 +341,13 @@ class _SplashScreenState extends State<SplashScreen> {
 EOF
 
 echo ""
+echo "Creating .env file..."
+cat > .env << 'EOF'
+# Environment variables
+API_BASE_URL=https://api.example.com
+APP_ENV=development
+EOF
+
 echo "Creating .gitkeep files..."
 
 # Create .gitkeep files for empty directories
