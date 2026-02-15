@@ -337,9 +337,9 @@ echo "Copying Makefile..."
 cat > Makefile << 'MAKEFILE_EOF'
 # Makefile for Flutter Project
 # Usage: make <command>
-# Examples: make clean, make install, make create_apk, make ipf_gen, make feature name=auth
+# Examples: make clean, make install, make create_apk, make code_gen, make feature name=auth
 
-.PHONY: help clean install apk apk_debug ipf_gen feature run build_runner watch get upgrade outdated analyze format test coverage doctor
+.PHONY: help clean install apk apk_debug code_gen feature run build_runner watch get upgrade outdated analyze format test coverage doctor
 
 # Default target - show help
 help:
@@ -348,7 +348,7 @@ help:
 	@echo "  make install        - Install app on connected device"
 	@echo "  make apk            - Build release APK and open folder"
 	@echo "  make apk_debug      - Build debug APK and open folder"
-	@echo "  make ipf_gen        - Run IPF generator"
+	@echo "  make code_gen        - Run IPF generator"
 	@echo "  make feature name=<feature_name> - Generate new feature structure"
 	@echo "  make run            - Run the app"
 	@echo "  make build_runner   - Run build_runner once"
@@ -405,8 +405,8 @@ apk_debug:
 	open build/app/outputs/flutter-apk/ || xdg-open build/app/outputs/flutter-apk/ || start build/app/outputs/flutter-apk/
 
 # Run IPF generator file to generate models, services, repositories, etc.
-ipf_gen:
-	flutter test ipf_generator.dart
+code_gen:
+	flutter test code_generator.dart
 
 # Run build_runner once
 build_runner:
