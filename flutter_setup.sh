@@ -1,304 +1,482 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Flutter Project Structure Initialization Script
-# This script creates a complete Flutter project with the specified folder structure
+set -euo pipefail
 
-set -e  # Exit on error
+# Restore cursor on exit so a Ctrl-C during a menu doesn't leave it hidden.
+trap 'tput cnorm 2>/dev/null || true' EXIT INT TERM
 
-PROJECT_NAME="$1"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STARTER_PACK_LOCAL_PATH="/Users/danfordchris/projects/iPF_Flutter_Starter_Pack"
+STARTER_PACK_GIT_URL="https://github.com/iPFSoftwares/iPF_Flutter_Starter_Pack.git"
+DEFAULT_APP_NAME="flutter_app_1"
 
-if [ -z "$PROJECT_NAME" ]; then
-    echo "Usage: ./init_flutter_project.sh <project_name>"
-    exit 1
-fi
+# ─── Utilities ────────────────────────────────────────────────────────────────
 
-echo "=========================================="
-echo "Creating Flutter Project: $PROJECT_NAME"
-echo "=========================================="
+log() { printf '%s\n' "$1"; }
+to_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+die() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+is_valid_starter_pack_path() { [[ -f "$1/pubspec.yaml" ]]; }
+ensure_directory() { mkdir -p "$1"; }
 
-# Create Flutter project
-flutter create "$PROJECT_NAME"
-
-
-# Navigate into project
-cd "$PROJECT_NAME"
-
-echo ""
-echo "Installing required packages..."
-flutter pub add go_router
-flutter pub add flutter_pack
-flutter pub get
-
-echo "Adding dotenv support..."
-flutter pub add flutter_dotenv
-
-echo "Injecting assets into existing flutter section..."
-
-awk '
-/uses-material-design: true/ && !x {
-    print;
-    print "";
-    print "  assets:";
-    print "    - assets/images/";
-    print "    - assets/svgs/";
-    print "    - assets/fonts/";
-    print "    - .env";
-    x=1;
-    next
+prompt_with_default() {
+  local question="$1" default="$2" answer=""
+  read -r -p "$question [$default]: " answer
+  printf '%s\n' "${answer:-$default}"
 }
-{print}
-' pubspec.yaml > pubspec.tmp && mv pubspec.tmp pubspec.yaml
 
-echo "Updating pubspec.yaml with flutter_intl..."
-cat >> pubspec.yaml << 'EOF'
+prompt_yes_no() {
+  local question="$1" default="$2" answer=""
+  read -r -p "$question [$default]: " answer
+  answer="${answer:-$default}"
+  case "$(to_lower "$answer")" in
+    y|yes|true|1)  printf 'true\n' ;;
+    n|no|false|0)  printf 'false\n' ;;
+    *)             printf '%s\n' "$(to_lower "$default")" ;;
+  esac
+}
 
-flutter_intl:
-  enabled: true
+# Arrow-key interactive menu. Use ↑/↓ to move, Enter to confirm.
+# Result stored in _MENU_RESULT (1-based). All I/O via /dev/tty — never call inside $().
+_MENU_RESULT=1
+prompt_select() {
+  local question="$1"
+  local default_index="$2"
+  shift 2
+  # After shift, $1..$# are the options. ${!i} resolves them by index.
+  local count="$#"
+  local cur=$(( default_index - 1 ))   # 0-based current index
+  local i key ch
+
+  printf '\n%s\n' "$question" >/dev/tty
+  printf '\0337' >/dev/tty             # DEC save cursor (ESC 7)
+
+  # Initial draw
+  for (( i = 1; i <= count; i++ )); do
+    if [[ $(( i - 1 )) -eq $cur ]]; then
+      printf '  \033[1;36m> %s\033[0m\033[K\n' "${!i}" >/dev/tty
+    else
+      printf '    %s\033[K\n' "${!i}" >/dev/tty
+    fi
+  done
+
+  tput civis >/dev/tty 2>/dev/null || true
+
+  while IFS= read -r -s -n1 key </dev/tty; do
+    case "$key" in
+      $'\x1b')
+        IFS= read -r -s -n1 -t 1 ch </dev/tty || true
+        if [[ "$ch" == '[' ]]; then
+          IFS= read -r -s -n1 -t 1 ch </dev/tty || true
+          case "$ch" in
+            A) cur=$(( (cur - 1 + count) % count )) ;;   # up arrow
+            B) cur=$(( (cur + 1) % count )) ;;           # down arrow
+          esac
+        fi
+        ;;
+      '' | $'\n' | $'\r') break ;;
+    esac
+
+    # Restore saved cursor then redraw the list in-place
+    printf '\0338' >/dev/tty           # DEC restore cursor (ESC 8)
+    for (( i = 1; i <= count; i++ )); do
+      if [[ $(( i - 1 )) -eq $cur ]]; then
+        printf '  \033[1;36m> %s\033[0m\033[K\n' "${!i}" >/dev/tty
+      else
+        printf '    %s\033[K\n' "${!i}" >/dev/tty
+      fi
+    done
+  done
+
+  tput cnorm >/dev/tty 2>/dev/null || true
+  printf '\n' >/dev/tty
+
+  _MENU_RESULT=$(( cur + 1 ))
+}
+
+sanitize_project_name() {
+  local v; v="$(to_lower "$1")"
+  v="${v// /_}"; v="${v//-/_}"
+  v="$(printf '%s' "$v" | tr -cd 'a-z0-9_')"
+  v="$(printf '%s' "$v" | tr -s '_')"
+  v="${v#_}"; v="${v%_}"
+  [[ -z "$v" ]] && die "App name must contain at least one valid character."
+  [[ "$v" =~ ^[0-9] ]] && v="flutter_${v}"
+  printf '%s\n' "$v"
+}
+
+sanitize_package_name() {
+  local v; v="$(to_lower "$1")"
+  v="${v// /.}"; v="${v//-/.}"
+  v="$(printf '%s' "$v" | tr -cd 'a-z0-9_.')"
+  v="$(printf '%s' "$v" | tr -s '.')"
+  v="${v#.}"; v="${v%.}"
+  [[ -z "$v" ]] && die "Package name must contain at least one valid character."
+  [[ "$v" != *.* ]] && v="com.${v}.app"
+  printf '%s\n' "$v"
+}
+
+title_case() {
+  printf '%s' "$1" | tr '_-' '  ' | awk '{for(i=1;i<=NF;i++){$i=toupper(substr($i,1,1))substr($i,2)} print}'
+}
+
+setup_android_signing() {
+  local alias="$1" key_pass="$2" store_pass="$3"
+  log "Configuring Android app signing..."
+
+  cat > android/key.properties <<EOF
+storePassword=${store_pass}
+keyPassword=${key_pass}
+keyAlias=${alias}
+storeFile=../keystore.jks
 EOF
 
-echo ""
-echo "Creating folder structure..."
+  if command -v keytool &>/dev/null; then
+    keytool -genkeypair -v \
+      -keystore android/keystore.jks \
+      -keyalg RSA -keysize 2048 -validity 10000 \
+      -alias "$alias" \
+      -dname "CN=$DISPLAY_NAME, O=$PROJECT_NAME, C=US" \
+      -storepass "$store_pass" \
+      -keypass "$key_pass" \
+      >/dev/null 2>&1 \
+      && log "  Keystore generated: android/keystore.jks" \
+      || log "  Warning: keytool failed — generate android/keystore.jks manually."
+  else
+    log "  keytool not found — generate android/keystore.jks manually."
+  fi
 
-# Create core directories
-mkdir -p lib/core/constants
-mkdir -p lib/core/extensions
-mkdir -p lib/core/mixins
-mkdir -p lib/core/resources
-mkdir -p lib/core/theme
-mkdir -p lib/core/utils
+  # Never commit signing secrets
+  printf '\n# Signing — never commit\nandroid/key.properties\nandroid/keystore.jks\n' >> .gitignore
 
-# Create feature directories
-mkdir -p lib/features
+  # Patch build.gradle / build.gradle.kts with signing config
+  python3 - <<PY
+from pathlib import Path
+import re
 
-# Create dao directory
-mkdir -p lib/dao
+def patch_gradle(path):
+    if not path.exists():
+        return
+    text = path.read_text()
+    if 'keystoreProperties' in text:
+        return
+    kts = path.suffix == '.kts'
+    if kts:
+        header = ('import java.io.FileInputStream\nimport java.util.Properties\n\n'
+                  'val keystoreProperties = Properties()\n'
+                  'val keystorePropertiesFile = rootProject.file("key.properties")\n'
+                  'if (keystorePropertiesFile.exists()) {\n'
+                  '    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n}\n\n')
+        sig = ('\n    signingConfigs {\n'
+               '        create("release") {\n'
+               '            keyAlias = keystoreProperties["keyAlias"] as String? ?: ""\n'
+               '            keyPassword = keystoreProperties["keyPassword"] as String? ?: ""\n'
+               '            storeFile = file(keystoreProperties["storeFile"] as String? ?: "keystore.jks")\n'
+               '            storePassword = keystoreProperties["storePassword"] as String? ?: ""\n'
+               '        }\n'
+               '        getByName("debug") {\n'
+               '            keyAlias = keystoreProperties["keyAlias"] as String? ?: ""\n'
+               '            keyPassword = keystoreProperties["keyPassword"] as String? ?: ""\n'
+               '            storeFile = file(keystoreProperties["storeFile"] as String? ?: "keystore.jks")\n'
+               '            storePassword = keystoreProperties["storePassword"] as String? ?: ""\n'
+               '        }\n    }')
+        rel = '\n            signingConfig = signingConfigs.getByName("release")'
+        dbg = '\n            signingConfig = signingConfigs.getByName("debug")'
+    else:
+        header = ("def keystoreProperties = new Properties()\n"
+                  "def keystorePropertiesFile = rootProject.file('key.properties')\n"
+                  "if (keystorePropertiesFile.exists()) {\n"
+                  "    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n}\n\n")
+        sig = ("\n    signingConfigs {\n"
+               "        release {\n"
+               "            keyAlias keystoreProperties['keyAlias'] ?: ''\n"
+               "            keyPassword keystoreProperties['keyPassword'] ?: ''\n"
+               "            storeFile file(keystoreProperties['storeFile'] ?: 'keystore.jks')\n"
+               "            storePassword keystoreProperties['storePassword'] ?: ''\n"
+               "        }\n"
+               "        debug {\n"
+               "            keyAlias keystoreProperties['keyAlias'] ?: ''\n"
+               "            keyPassword keystoreProperties['keyPassword'] ?: ''\n"
+               "            storeFile file(keystoreProperties['storeFile'] ?: 'keystore.jks')\n"
+               "            storePassword keystoreProperties['storePassword'] ?: ''\n"
+               "        }\n    }")
+        rel = "\n            signingConfig signingConfigs.release"
+        dbg = "\n            signingConfig signingConfigs.debug"
 
-# Create l10n directory with ARB files
-mkdir -p lib/l10n
+    text = header + text
+    text = re.sub(r'(android\s*\{)', r'\1' + sig, text, count=1)
+    # inject signingConfig into release buildType
+    text = re.sub(r'(release\s*\{)', r'\1' + rel, text, count=1)
+    # inject signingConfig into debug buildType
+    text = re.sub(r'(debug\s*\{)', r'\1' + dbg, text, count=1)
+    path.write_text(text)
 
-# Create root directory
-mkdir -p lib/root
+for f in ['android/app/build.gradle', 'android/app/build.gradle.kts']:
+    patch_gradle(Path(f))
+print("  build.gradle signing config applied.")
+PY
+}
 
-# Create services directory
-mkdir -p lib/services
+run_skill_initializer() {
+  log "Initializing starter-pack skills..."
+  # Suppress all output — dart run uses dart pub which errors on Flutter-only sdks
+  # when the dart binary is not the Flutter-bundled one.
+  if dart run ipf_flutter_starter_pack:initialize_skills >/dev/null 2>&1; then
+    log "  Skills initialized."
+    return 0
+  fi
+  if dart run ipf_flutter_starter_pack:install_skills >/dev/null 2>&1; then
+    log "  Skills installed."
+    return 0
+  fi
+  log "  Skill initializer unavailable. Run 'make initialize_skills' after setup."
+}
 
-# Create shared directories
-mkdir -p lib/shared/components
-mkdir -p lib/shared/controllers
+# Run build_runner in a Flutter-SDK-aware context.
+run_build_runner() {
+  if dart run build_runner build --delete-conflicting-outputs >/dev/null 2>&1; then
+    return 0
+  fi
+  # Fallback: flutter pub run has the Flutter SDK in scope even when dart does not.
+  flutter pub run build_runner build --delete-conflicting-outputs
+}
 
-# Create assets directories
-mkdir -p assets/fonts
-mkdir -p assets/images
-mkdir -p assets/svgs
+# ─── Prompts ──────────────────────────────────────────────────────────────────
 
-# Create test directory (already exists but ensure it's there)
-mkdir -p test
+APP_NAME_DEFAULT="${1:-$DEFAULT_APP_NAME}"
+APP_NAME_RAW="$(prompt_with_default "App name" "$APP_NAME_DEFAULT")"
+PROJECT_NAME="$(sanitize_project_name "$APP_NAME_RAW")"
+DEFAULT_DERIVED_PACKAGE="com.${PROJECT_NAME}.app"
+PACKAGE_NAME_RAW="$(prompt_with_default "Package name" "$DEFAULT_DERIVED_PACKAGE")"
+PACKAGE_NAME="$(sanitize_package_name "$PACKAGE_NAME_RAW")"
 
+prompt_select "State management:" 1 "provider" "riverpod" "bloc"
+case "$_MENU_RESULT" in
+  1) STATE_MANAGEMENT="provider" ;;
+  2) STATE_MANAGEMENT="riverpod" ;;
+  3) STATE_MANAGEMENT="bloc" ;;
+  *) STATE_MANAGEMENT="provider" ;;
+esac
 
-echo ""
-echo "Creating extension files..."
+prompt_select "Navigator:" 1 "go_router" "navigator 2.0" "auto_route"
+case "$_MENU_RESULT" in
+  1) NAVIGATOR="go_router" ;;
+  2) NAVIGATOR="navigator_2_0" ;;
+  3) NAVIGATOR="auto_route" ;;
+  *) NAVIGATOR="go_router" ;;
+esac
 
-cat > lib/core/extensions/build_context_extension.dart << 'EOF'
+APP_SIGNING="$(prompt_yes_no "Enable app signing (debug + release)" "false")"
+
+KEY_ALIAS=""
+KEY_PASSWORD=""
+KEYSTORE_PASSWORD=""
+if [[ "$APP_SIGNING" == "true" ]]; then
+  KEY_ALIAS="$(prompt_with_default "Signing key alias" "upload")"
+  printf 'Key password (input hidden): ' >/dev/tty
+  IFS= read -r -s KEY_PASSWORD </dev/tty; printf '\n' >/dev/tty
+  printf 'Keystore password (input hidden): ' >/dev/tty
+  IFS= read -r -s KEYSTORE_PASSWORD </dev/tty; printf '\n' >/dev/tty
+  if [[ -z "$KEY_PASSWORD" || -z "$KEYSTORE_PASSWORD" ]]; then
+    die "Key password and keystore password are required when signing is enabled."
+  fi
+fi
+
+DISPLAY_NAME="$(title_case "$PROJECT_NAME")"
+PROJECT_ORG="$(printf '%s' "$PACKAGE_NAME" | awk -F'.' '{print $1"."$2}')"
+GENERATED_IDENTIFIER="${PROJECT_ORG}.${PROJECT_NAME}"
+
+[[ -e "$PROJECT_NAME" ]] && die "Directory '$PROJECT_NAME' already exists. Remove it or choose a different name."
+
+log ""
+log "=========================================="
+log "Creating:  $PROJECT_NAME"
+log "Package:   $PACKAGE_NAME"
+log "State:     $STATE_MANAGEMENT"
+log "Navigator: $NAVIGATOR"
+log "Signing:   $APP_SIGNING"
+log "=========================================="
+
+# ─── Create Flutter project ────────────────────────────────────────────────────
+
+flutter create --org "$PROJECT_ORG" --platforms android,ios,web,macos,windows,linux "$PROJECT_NAME"
+cd "$PROJECT_NAME"
+
+# ─── Install packages ──────────────────────────────────────────────────────────
+
+log "Installing packages..."
+
+case "$STATE_MANAGEMENT" in
+  provider)
+    flutter pub add provider
+    ;;
+  riverpod)
+    flutter pub add flutter_riverpod
+    ;;
+  bloc)
+    # Pin modern versions — prevents pub resolving to old bloc 1.x that circularly depends on flutter_bloc
+    flutter pub add 'flutter_bloc:^9.0.0' 'equatable:^2.0.0'
+    ;;
+esac
+
+case "$NAVIGATOR" in
+  go_router)
+    flutter pub add go_router
+    ;;
+  auto_route)
+    flutter pub add auto_route
+    flutter pub add --dev auto_route_generator
+    ;;
+esac
+
+# build_runner is always available as a dev dep (skill initializer fallback needs it)
+flutter pub add --dev build_runner
+
+log "Installing ipf_flutter_starter_pack..."
+if is_valid_starter_pack_path "$STARTER_PACK_LOCAL_PATH"; then
+  log "  Using local path: $STARTER_PACK_LOCAL_PATH"
+  if ! flutter pub add ipf_flutter_starter_pack --path "$STARTER_PACK_LOCAL_PATH" 2>/dev/null; then
+    log "  Local path failed. Falling back to git."
+    flutter pub add ipf_flutter_starter_pack --git-url "$STARTER_PACK_GIT_URL" --git-ref develop
+  fi
+else
+  log "  Local path invalid. Using git."
+  flutter pub add ipf_flutter_starter_pack --git-url "$STARTER_PACK_GIT_URL" --git-ref develop
+fi
+
+flutter pub add toastification
+flutter pub get
+
+log "Running skill initializer..."
+run_skill_initializer
+
+# ─── Folder structure ──────────────────────────────────────────────────────────
+
+log "Creating folder structure..."
+for dir in \
+  lib/core/constants lib/core/extensions lib/core/mixins \
+  lib/core/resources lib/core/router lib/core/theme lib/core/utils \
+  lib/features/auth/{models,providers,screens,services,widgets} \
+  lib/features/home/{models,providers,screens,services,widgets} \
+  lib/features/markets/{models,providers,screens,services,widgets} \
+  lib/features/my_story/{models,providers,screens,services,widgets} \
+  lib/features/notifications/{models,providers,screens,services,widgets} \
+  lib/features/orders/{models,providers,screens,services,widgets} \
+  lib/features/profile/{models,providers,screens,services,widgets} \
+  lib/features/updates/{models,providers,screens,services,widgets} \
+  lib/l10n lib/root lib/services \
+  lib/shared/providers lib/shared/widgets \
+  assets/fonts assets/images assets/svgs \
+  .claude/commands .claude/skills; do
+  ensure_directory "$dir"
+done
+
+# ─── Core: theme ──────────────────────────────────────────────────────────────
+
+log "Writing scaffold files..."
+
+cat > lib/core/theme/app_theme.dart <<'EOF'
+import 'package:flutter/material.dart';
+
+class AppTheme {
+  AppTheme._();
+
+  static const Color _seedColor = Color(0xFF0F766E);
+
+  static ThemeData get lightTheme => ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.light,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: _seedColor,
+          brightness: Brightness.light,
+        ),
+        scaffoldBackgroundColor: const Color(0xFFF7F9FC),
+      );
+
+  static ThemeData get darkTheme => ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: _seedColor,
+          brightness: Brightness.dark,
+        ),
+      );
+}
+EOF
+
+# ─── Core: resources ──────────────────────────────────────────────────────────
+
+cat > lib/core/resources/resources.dart <<'EOF'
+library resources;
+
+export 'app_assets.dart';
+EOF
+
+cat > lib/core/resources/app_assets.dart <<'EOF'
+class AppAssets {
+  AppAssets._();
+
+  static const String logo = 'assets/images/logo.png';
+  static const String emptyState = 'assets/images/empty_state.png';
+}
+EOF
+
+# ─── Core: extensions ─────────────────────────────────────────────────────────
+
+if [[ "$NAVIGATOR" == "go_router" ]]; then
+  cat > lib/core/extensions/build_context_extension.dart <<'EOF'
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
 extension BuildContextExtension on BuildContext {
   GoRouterState get goRouterState => GoRouterState.of(this);
-  String? get currentRoute => goRouterState.fullPath;
-
   ThemeData get themeData => Theme.of(this);
-
   ColorScheme get colorScheme => themeData.colorScheme;
-
-  TextTheme get textTheme => Theme.of(this).textTheme;
-
-  TextStyle get displayLarge => textTheme.displayLarge!;
-  TextStyle get displayMedium => textTheme.displayMedium!;
-  TextStyle get displaySmall => textTheme.displaySmall!;
-
-  TextStyle get headlineLarge => textTheme.headlineLarge!;
-  TextStyle get headlineMedium => textTheme.headlineMedium!;
-  TextStyle get headlineSmall => textTheme.headlineSmall!;
-
-  TextStyle get titleLarge => textTheme.titleLarge!;
-  TextStyle get titleMedium => textTheme.titleMedium!;
-  TextStyle get titleSmall => textTheme.titleSmall!;
-
-  TextStyle get bodyLarge => textTheme.bodyLarge!;
-  TextStyle get bodyMedium => textTheme.bodyMedium!;
-  TextStyle get bodySmall => textTheme.bodySmall!;
-
-  TextStyle get labelLarge => textTheme.labelLarge!;
-  TextStyle get labelMedium => textTheme.labelMedium!;
-  TextStyle get labelSmall => textTheme.labelSmall!;
-
-  double get width => MediaQuery.of(this).size.width;
-  double get height => MediaQuery.of(this).size.height;
+  TextTheme get textTheme => themeData.textTheme;
+  double get width => MediaQuery.sizeOf(this).width;
+  double get height => MediaQuery.sizeOf(this).height;
 }
 EOF
-
-echo ""
-echo "Creating core resource files..."
-
-# Create core resource files
-cat > lib/core/resources/resources.dart << 'EOF'
-/// Main resources file that exports all resource files
-library resources;
-
-export 'app_fonts.dart';
-export 'images.dart';
-export 'svgs.dart';
-EOF
-
-cat > lib/core/resources/app_fonts.dart << 'EOF'
-/// App fonts resources
-class AppFonts {
-  AppFonts._();
-
-  // Add your font family names here
-  // Example:
-  // static const String roboto = 'Roboto';
-  // static const String openSans = 'OpenSans';
-}
-EOF
-
-cat > lib/core/resources/images.dart << 'EOF'
-/// Image assets resources
-class Images {
-  Images._();
-
-  // Add your image asset paths here
-  // Example:
-  // static const String logo = 'assets/images/logo.png';
-  // static const String placeholder = 'assets/images/placeholder.png';
-}
-EOF
-
-cat > lib/core/resources/svgs.dart << 'EOF'
-/// SVG assets resources
-class Svgs {
-  Svgs._();
-
-  // Add your SVG asset paths here
-  // Example:
-  // static const String iconHome = 'assets/svgs/icon_home.svg';
-  // static const String iconProfile = 'assets/svgs/icon_profile.svg';
-}
-EOF
-
-echo ""
-echo "Creating theme files..."
-
-cat > lib/core/theme/app_theme.dart << 'EOF'
-import 'package:flutter/material.dart';
-import 'custom_colors.dart';
-
-/// Application theme configuration
-class AppTheme {
-  AppTheme._();
-
-  static ThemeData get lightTheme {
-    return ThemeData(
-      useMaterial3: true,
-      brightness: Brightness.light,
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: CustomColors.primary,
-        brightness: Brightness.light,
-      ),
-      // Add your custom theme configuration here
-    );
-  }
-
-  static ThemeData get darkTheme {
-    return ThemeData(
-      useMaterial3: true,
-      brightness: Brightness.dark,
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: CustomColors.primary,
-        brightness: Brightness.dark,
-      ),
-      // Add your custom theme configuration here
-    );
-  }
-}
-EOF
-
-cat > lib/core/theme/custom_colors.dart << 'EOF'
+else
+  cat > lib/core/extensions/build_context_extension.dart <<'EOF'
 import 'package:flutter/material.dart';
 
-/// Custom color definitions for the app
-class CustomColors {
-  CustomColors._();
+extension BuildContextExtension on BuildContext {
+  ThemeData get themeData => Theme.of(this);
+  ColorScheme get colorScheme => themeData.colorScheme;
+  TextTheme get textTheme => themeData.textTheme;
+  double get width => MediaQuery.sizeOf(this).width;
+  double get height => MediaQuery.sizeOf(this).height;
+}
+EOF
+fi
 
-  // Primary colors
-  static const Color primary = Color(0xFF6200EE);
-  static const Color primaryVariant = Color(0xFF3700B3);
-  static const Color secondary = Color(0xFF03DAC6);
+# ─── Navigator: router + splash ───────────────────────────────────────────────
 
-  // Add more custom colors here
+if [[ "$NAVIGATOR" == "go_router" ]]; then
+
+  cat > lib/core/router/router.dart <<'EOF'
+import 'package:go_router/go_router.dart';
+
+import '../../root/home_screen.dart';
+import '../../root/splash_screen.dart';
+
+class AppRouter {
+  AppRouter._();
+
+  static final GoRouter router = GoRouter(
+    initialLocation: '/',
+    routes: [
+      GoRoute(path: '/', builder: (context, state) => const SplashScreen()),
+      GoRoute(path: '/home', builder: (context, state) => const HomeScreen()),
+    ],
+  );
 }
 EOF
 
-echo ""
-echo "Creating l10n files..."
-
-cat > lib/l10n/intl_en.arb << 'EOF'
-{
-  "@@locale": "en",
-  "appTitle": "My App",
-  "@appTitle": {
-    "description": "The title of the application"
-  }
-}
-EOF
-
-cat > lib/l10n/intl_ar.arb << 'EOF'
-{
-  "@@locale": "ar",
-  "appTitle": "تطبيقي",
-  "@appTitle": {
-    "description": "The title of the application"
-  }
-}
-EOF
-
-cat > lib/l10n/intl_es.arb << 'EOF'
-{
-  "@@locale": "es",
-  "appTitle": "Mi Aplicación",
-  "@appTitle": {
-    "description": "The title of the application"
-  }
-}
-EOF
-
-cat > lib/l10n/intl_fr.arb << 'EOF'
-{
-  "@@locale": "fr",
-  "appTitle": "Mon Application",
-  "@appTitle": {
-    "description": "The title of the application"
-  }
-}
-EOF
-
-cat > lib/l10n/intl_sw.arb << 'EOF'
-{
-  "@@locale": "sw",
-  "appTitle": "Programu Yangu",
-  "@appTitle": {
-    "description": "The title of the application"
-  }
-}
-EOF
-
-echo ""
-echo "Creating splash screen..."
-
-cat > lib/root/splash_screen.dart << 'EOF'
+  cat > lib/root/splash_screen.dart <<'EOF'
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 
-/// Splash screen widget
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
@@ -310,28 +488,34 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    _navigateToHome();
-  }
-
-  Future<void> _navigateToHome() async {
-    await Future.delayed(const Duration(seconds: 2));
-    if (mounted) {
-      // Navigate to your home screen
-      // Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => HomeScreen()));
-    }
+    Future<void>.delayed(const Duration(milliseconds: 900), () {
+      if (mounted) context.go('/home');
+    });
   }
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     return Scaffold(
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            // Add your logo here
-            const FlutterLogo(size: 100),
-            const SizedBox(height: 24),
-            const CircularProgressIndicator(),
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(28),
+              ),
+              child: Icon(
+                Icons.flutter_dash_rounded,
+                size: 56,
+                color: colorScheme.onPrimaryContainer,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text('Loading…', style: Theme.of(context).textTheme.titleMedium),
           ],
         ),
       ),
@@ -340,316 +524,1033 @@ class _SplashScreenState extends State<SplashScreen> {
 }
 EOF
 
-echo ""
-echo "Creating .env file..."
-cat > .env << 'EOF'
-# Environment variables
-API_BASE_URL=https://api.example.com
-APP_ENV=development
+elif [[ "$NAVIGATOR" == "navigator_2_0" ]]; then
+
+  cat > lib/core/router/routes.dart <<'EOF'
+abstract class AppRoutes {
+  static const String splash = '/';
+  static const String home = '/home';
+}
 EOF
 
-echo "Creating .gitkeep files..."
+  cat > lib/root/splash_screen.dart <<'EOF'
+import 'package:flutter/material.dart';
 
-# Create .gitkeep files for empty directories
-touch lib/core/constants/.gitkeep
-touch lib/core/extensions/.gitkeep
-touch lib/core/mixins/.gitkeep
-touch lib/core/utils/.gitkeep
-touch lib/dao/.gitkeep
-touch lib/features/.gitkeep
-touch lib/services/.gitkeep
-touch lib/shared/components/.gitkeep
-touch lib/shared/controllers/.gitkeep
-touch assets/fonts/.gitkeep
-touch assets/images/.gitkeep
-touch assets/svgs/.gitkeep
+import '../core/router/routes.dart';
 
-echo ""
-echo "Copying Makefile..."
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
 
-# Create the Makefile
-cat > Makefile << 'MAKEFILE_EOF'
-# Makefile for Flutter Project
-# Usage: make <command>
-# Examples: make clean, make install, make create_apk, make code_gen, make feature name=auth
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
 
-.PHONY: help clean install apk apk_debug code_gen feature run build_runner watch get upgrade outdated analyze format test coverage doctor
+class _SplashScreenState extends State<SplashScreen> {
+  @override
+  void initState() {
+    super.initState();
+    Future<void>.delayed(const Duration(milliseconds: 900), () {
+      if (mounted) {
+        Navigator.of(context).pushReplacementNamed(AppRoutes.home);
+      }
+    });
+  }
 
-# Default target - show help
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(28),
+              ),
+              child: Icon(
+                Icons.flutter_dash_rounded,
+                size: 56,
+                color: colorScheme.onPrimaryContainer,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text('Loading…', style: Theme.of(context).textTheme.titleMedium),
+          ],
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+elif [[ "$NAVIGATOR" == "auto_route" ]]; then
+
+  cat > lib/core/router/router.dart <<'EOF'
+import 'package:auto_route/auto_route.dart';
+
+import '../../root/home_screen.dart';
+import '../../root/splash_screen.dart';
+
+part 'router.gr.dart';
+
+@AutoRouterConfig(replaceInRouteName: 'Screen,Route')
+class AppRouter extends RootStackRouter {
+  @override
+  List<AutoRoute> get routes => [
+        AutoRoute(page: SplashRoute.page, path: '/', initial: true),
+        AutoRoute(page: HomeRoute.page, path: '/home'),
+      ];
+}
+EOF
+
+  cat > lib/root/splash_screen.dart <<'EOF'
+import 'package:auto_route/auto_route.dart';
+import 'package:flutter/material.dart';
+
+@RoutePage()
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen> {
+  @override
+  void initState() {
+    super.initState();
+    Future<void>.delayed(const Duration(milliseconds: 900), () {
+      if (mounted) context.router.pushNamed('/home');
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(28),
+              ),
+              child: Icon(
+                Icons.flutter_dash_rounded,
+                size: 56,
+                color: colorScheme.onPrimaryContainer,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text('Loading…', style: Theme.of(context).textTheme.titleMedium),
+          ],
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+fi
+
+# ─── Home screen ──────────────────────────────────────────────────────────────
+
+if [[ "$NAVIGATOR" == "auto_route" ]]; then
+  cat > lib/root/home_screen.dart <<'EOF'
+import 'package:auto_route/auto_route.dart';
+import 'package:flutter/material.dart';
+
+@RoutePage()
+class HomeScreen extends StatelessWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Home')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: colorScheme.surface,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: colorScheme.outlineVariant),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Project scaffold ready',
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Add screens, providers, and services under lib/features.',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+EOF
+else
+  cat > lib/root/home_screen.dart <<'EOF'
+import 'package:flutter/material.dart';
+
+class HomeScreen extends StatelessWidget {
+  const HomeScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Home')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: colorScheme.surface,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: colorScheme.outlineVariant),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Project scaffold ready',
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Add screens, providers, and services under lib/features.',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+EOF
+fi
+
+# ─── State management files ───────────────────────────────────────────────────
+
+if [[ "$STATE_MANAGEMENT" == "provider" ]]; then
+
+  cat > lib/shared/providers/app_provider.dart <<'EOF'
+import 'package:flutter/material.dart';
+
+class AppProvider extends ChangeNotifier {
+  ThemeMode _themeMode = ThemeMode.system;
+
+  ThemeMode get themeMode => _themeMode;
+
+  void setThemeMode(ThemeMode value) {
+    if (_themeMode == value) return;
+    _themeMode = value;
+    notifyListeners();
+  }
+}
+EOF
+
+  cat > lib/shared/providers/providers.dart <<'EOF'
+import 'package:provider/provider.dart';
+
+import 'app_provider.dart';
+
+final List<SingleChildWidget> appProviders = [
+  ChangeNotifierProvider(create: (_) => AppProvider()),
+];
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "riverpod" ]]; then
+
+  cat > lib/shared/providers/app_notifier.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+class AppNotifier extends Notifier<ThemeMode> {
+  @override
+  ThemeMode build() => ThemeMode.system;
+
+  void setThemeMode(ThemeMode mode) => state = mode;
+}
+
+final appNotifierProvider = NotifierProvider<AppNotifier, ThemeMode>(
+  AppNotifier.new,
+);
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "bloc" ]]; then
+
+  ensure_directory lib/shared/bloc
+
+  cat > lib/shared/bloc/app_event.dart <<'EOF'
+part of 'app_bloc.dart';
+
+abstract class AppEvent {}
+
+class AppThemeModeChanged extends AppEvent {
+  AppThemeModeChanged(this.themeMode);
+  final ThemeMode themeMode;
+}
+EOF
+
+  cat > lib/shared/bloc/app_state.dart <<'EOF'
+part of 'app_bloc.dart';
+
+class AppState extends Equatable {
+  const AppState({this.themeMode = ThemeMode.system});
+
+  final ThemeMode themeMode;
+
+  AppState copyWith({ThemeMode? themeMode}) =>
+      AppState(themeMode: themeMode ?? this.themeMode);
+
+  @override
+  List<Object?> get props => [themeMode];
+}
+EOF
+
+  cat > lib/shared/bloc/app_bloc.dart <<'EOF'
+import 'package:equatable/equatable.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+part 'app_event.dart';
+part 'app_state.dart';
+
+class AppBloc extends Bloc<AppEvent, AppState> {
+  AppBloc() : super(const AppState()) {
+    on<AppThemeModeChanged>(
+      (event, emit) => emit(state.copyWith(themeMode: event.themeMode)),
+    );
+  }
+}
+EOF
+
+fi
+
+# ─── app.dart (matrix: state × navigator) ────────────────────────────────────
+
+if [[ "$STATE_MANAGEMENT" == "provider" && "$NAVIGATOR" == "go_router" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../core/router/router.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/providers/app_provider.dart';
+import '../shared/providers/providers.dart';
+
+class ProjectApp extends StatelessWidget {
+  const ProjectApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiProvider(
+      providers: appProviders,
+      child: Builder(
+        builder: (ctx) => MaterialApp.router(
+          debugShowCheckedModeBanner: false,
+          themeMode: ctx.watch<AppProvider>().themeMode,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          routerConfig: AppRouter.router,
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "provider" && "$NAVIGATOR" == "navigator_2_0" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../core/router/routes.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/providers/app_provider.dart';
+import '../shared/providers/providers.dart';
+import 'home_screen.dart';
+import 'splash_screen.dart';
+
+class ProjectApp extends StatelessWidget {
+  const ProjectApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiProvider(
+      providers: appProviders,
+      child: Builder(
+        builder: (ctx) => MaterialApp(
+          debugShowCheckedModeBanner: false,
+          themeMode: ctx.watch<AppProvider>().themeMode,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          initialRoute: AppRoutes.splash,
+          routes: {
+            AppRoutes.splash: (_) => const SplashScreen(),
+            AppRoutes.home: (_) => const HomeScreen(),
+          },
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "provider" && "$NAVIGATOR" == "auto_route" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '../core/router/router.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/providers/app_provider.dart';
+import '../shared/providers/providers.dart';
+
+class ProjectApp extends StatefulWidget {
+  const ProjectApp({super.key});
+
+  @override
+  State<ProjectApp> createState() => _ProjectAppState();
+}
+
+class _ProjectAppState extends State<ProjectApp> {
+  final _appRouter = AppRouter();
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiProvider(
+      providers: appProviders,
+      child: Builder(
+        builder: (ctx) => MaterialApp.router(
+          debugShowCheckedModeBanner: false,
+          themeMode: ctx.watch<AppProvider>().themeMode,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          routerConfig: _appRouter.config(),
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "riverpod" && "$NAVIGATOR" == "go_router" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../core/router/router.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/providers/app_notifier.dart';
+
+class ProjectApp extends ConsumerWidget {
+  const ProjectApp({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final themeMode = ref.watch(appNotifierProvider);
+    return MaterialApp.router(
+      debugShowCheckedModeBanner: false,
+      themeMode: themeMode,
+      theme: AppTheme.lightTheme,
+      darkTheme: AppTheme.darkTheme,
+      routerConfig: AppRouter.router,
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "riverpod" && "$NAVIGATOR" == "navigator_2_0" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../core/router/routes.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/providers/app_notifier.dart';
+import 'home_screen.dart';
+import 'splash_screen.dart';
+
+class ProjectApp extends ConsumerWidget {
+  const ProjectApp({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final themeMode = ref.watch(appNotifierProvider);
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      themeMode: themeMode,
+      theme: AppTheme.lightTheme,
+      darkTheme: AppTheme.darkTheme,
+      initialRoute: AppRoutes.splash,
+      routes: {
+        AppRoutes.splash: (_) => const SplashScreen(),
+        AppRoutes.home: (_) => const HomeScreen(),
+      },
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "riverpod" && "$NAVIGATOR" == "auto_route" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../core/router/router.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/providers/app_notifier.dart';
+
+class ProjectApp extends ConsumerStatefulWidget {
+  const ProjectApp({super.key});
+
+  @override
+  ConsumerState<ProjectApp> createState() => _ProjectAppState();
+}
+
+class _ProjectAppState extends ConsumerState<ProjectApp> {
+  final _appRouter = AppRouter();
+
+  @override
+  Widget build(BuildContext context) {
+    final themeMode = ref.watch(appNotifierProvider);
+    return MaterialApp.router(
+      debugShowCheckedModeBanner: false,
+      themeMode: themeMode,
+      theme: AppTheme.lightTheme,
+      darkTheme: AppTheme.darkTheme,
+      routerConfig: _appRouter.config(),
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "bloc" && "$NAVIGATOR" == "go_router" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '../core/router/router.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/bloc/app_bloc.dart';
+
+class ProjectApp extends StatelessWidget {
+  const ProjectApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return BlocProvider(
+      create: (_) => AppBloc(),
+      child: BlocBuilder<AppBloc, AppState>(
+        buildWhen: (prev, curr) => prev.themeMode != curr.themeMode,
+        builder: (_, state) => MaterialApp.router(
+          debugShowCheckedModeBanner: false,
+          themeMode: state.themeMode,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          routerConfig: AppRouter.router,
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "bloc" && "$NAVIGATOR" == "navigator_2_0" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '../core/router/routes.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/bloc/app_bloc.dart';
+import 'home_screen.dart';
+import 'splash_screen.dart';
+
+class ProjectApp extends StatelessWidget {
+  const ProjectApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return BlocProvider(
+      create: (_) => AppBloc(),
+      child: BlocBuilder<AppBloc, AppState>(
+        buildWhen: (prev, curr) => prev.themeMode != curr.themeMode,
+        builder: (_, state) => MaterialApp(
+          debugShowCheckedModeBanner: false,
+          themeMode: state.themeMode,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          initialRoute: AppRoutes.splash,
+          routes: {
+            AppRoutes.splash: (_) => const SplashScreen(),
+            AppRoutes.home: (_) => const HomeScreen(),
+          },
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "bloc" && "$NAVIGATOR" == "auto_route" ]]; then
+  cat > lib/root/app.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '../core/router/router.dart';
+import '../core/theme/app_theme.dart';
+import '../shared/bloc/app_bloc.dart';
+
+class ProjectApp extends StatefulWidget {
+  const ProjectApp({super.key});
+
+  @override
+  State<ProjectApp> createState() => _ProjectAppState();
+}
+
+class _ProjectAppState extends State<ProjectApp> {
+  final _appRouter = AppRouter();
+
+  @override
+  Widget build(BuildContext context) {
+    return BlocProvider(
+      create: (_) => AppBloc(),
+      child: BlocBuilder<AppBloc, AppState>(
+        buildWhen: (prev, curr) => prev.themeMode != curr.themeMode,
+        builder: (_, state) => MaterialApp.router(
+          debugShowCheckedModeBanner: false,
+          themeMode: state.themeMode,
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          routerConfig: _appRouter.config(),
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+fi
+
+# ─── main.dart ────────────────────────────────────────────────────────────────
+
+if [[ "$STATE_MANAGEMENT" == "provider" ]]; then
+  cat > lib/main.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:ipf_flutter_starter_pack/ipf_flutter_starter_pack.dart';
+import 'package:provider/provider.dart';
+
+import 'root/app.dart';
+import 'shared/providers/providers.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: '.env');
+  await AppDatabase.instance.init();
+  AppNotificationService.instance.init();
+  runApp(
+    MultiProvider(
+      providers: appProviders,
+      child: const ProjectApp(),
+    ),
+  );
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "riverpod" ]]; then
+  cat > lib/main.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:ipf_flutter_starter_pack/ipf_flutter_starter_pack.dart';
+
+import 'root/app.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: '.env');
+  await AppDatabase.instance.init();
+  AppNotificationService.instance.init();
+  runApp(
+    const ProviderScope(
+      child: ProjectApp(),
+    ),
+  );
+}
+EOF
+
+elif [[ "$STATE_MANAGEMENT" == "bloc" ]]; then
+  cat > lib/main.dart <<'EOF'
+import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:ipf_flutter_starter_pack/ipf_flutter_starter_pack.dart';
+
+import 'root/app.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: '.env');
+  await AppDatabase.instance.init();
+  AppNotificationService.instance.init();
+  runApp(const ProjectApp());
+}
+EOF
+
+fi
+
+# ─── Shared widgets README ────────────────────────────────────────────────────
+
+cat > lib/shared/widgets/README.md <<'EOF'
+# Shared Widgets
+
+Place project-specific shared widgets here.
+Use Theme.of(context).colorScheme — never hardcode colors.
+EOF
+
+# ─── Static config files ──────────────────────────────────────────────────────
+
+cat > .env <<EOF
+APP_NAME=$PROJECT_NAME
+PACKAGE_NAME=$PACKAGE_NAME
+STATE_MANAGEMENT=$STATE_MANAGEMENT
+NAVIGATOR=$NAVIGATOR
+APP_SIGNING=$APP_SIGNING
+EOF
+
+cat > .env.example <<EOF
+APP_NAME=$PROJECT_NAME
+PACKAGE_NAME=$PACKAGE_NAME
+STATE_MANAGEMENT=$STATE_MANAGEMENT
+NAVIGATOR=$NAVIGATOR
+APP_SIGNING=$APP_SIGNING
+EOF
+
+cat > lib/l10n/app_en.arb <<EOF
+{
+  "@@locale": "en",
+  "appName": "$DISPLAY_NAME"
+}
+EOF
+
+cat > AGENTS.md <<EOF
+# Project Agent Guide
+
+This app was scaffolded with \`ipf_flutter_starter_pack\`.
+
+## Project Facts
+
+- App name: $DISPLAY_NAME
+- Project folder: $PROJECT_NAME
+- Package name: $PACKAGE_NAME
+- State management: $STATE_MANAGEMENT
+- Navigator: $NAVIGATOR
+- App signing: $APP_SIGNING
+
+## Architecture Flow
+
+\`screen/widget → provider/notifier/bloc → service → APIManager → model\`
+
+## Rules
+
+- Use \`ipf_flutter_starter_pack\` for package-level skills, helpers, and shared infra.
+- Keep widgets theme-driven; use colorScheme values — never hardcode colors.
+- Use \`APIManager\` for all network work.
+- Keep new feature code under \`lib/features/<feature>/\`.
+- Project commands live in \`.claude/commands\`.
+
+## Validation
+
+Run \`flutter analyze\` after non-trivial changes.
+EOF
+
+cat > CLAUDE.md <<EOF
+# Project Guide
+
+## What This Project Is
+
+\`$DISPLAY_NAME\` is a Flutter app scaffolded with \`ipf_flutter_starter_pack\`.
+
+## Conventions
+
+- State management: \`$STATE_MANAGEMENT\`
+- Navigator: \`$NAVIGATOR\`
+- Theme colors live in \`lib/core/theme\` — always consume via \`ThemeData\` and \`ColorScheme\`.
+- Use \`APIManager\` for service calls.
+- Feature-based layout: screens, providers/notifiers/blocs, services, models per feature.
+
+## Project Structure
+
+- \`lib/core/\`: theme, router, resources, utilities, extensions
+- \`lib/root/\`: app shell, splash, home
+- \`lib/features/\`: feature modules
+- \`lib/shared/\`: global state and reusable widgets
+- \`.claude/commands/\`: project-level workflow docs
+- \`.claude/skills/\`: starter-pack skill docs
+
+## Setup Notes
+
+- Android: network permissions and core library desugaring are configured.
+- iOS: bundle identifier and display name are set.
+- Only \`ipf_flutter_starter_pack\` is supported — not \`flutter_pack\`.
+EOF
+
+cat > README.md <<EOF
+# $DISPLAY_NAME
+
+Flutter project generated by the local setup script.
+
+## Configuration
+
+| Key | Value |
+|-----|-------|
+| Package | \`$PACKAGE_NAME\` |
+| State management | \`$STATE_MANAGEMENT\` |
+| Navigator | \`$NAVIGATOR\` |
+| App signing | \`$APP_SIGNING\` |
+
+## Run
+
+\`\`\`bash
+flutter pub get
+flutter run
+\`\`\`
+
+## Project layout
+
+- \`lib/core/\` — theme, routing, extensions, resources
+- \`lib/root/\` — app shell and entry screens
+- \`lib/features/\` — feature modules
+- \`lib/shared/\` — global state and reusable widgets
+EOF
+
+cat > Makefile <<'MAKEFILE_EOF'
+.PHONY: help clean get upgrade run analyze format test coverage doctor setup initialize_skills install_skills code_gen feature
+
 help:
 	@echo "Available commands:"
-	@echo "  make clean          - Clean project and get dependencies"
-	@echo "  make install        - Install app on connected device"
-	@echo "  make apk            - Build release APK and open folder"
-	@echo "  make apk_debug      - Build debug APK and open folder"
-	@echo "  make code_gen        - Run IPF generator"
-	@echo "  make feature name=<feature_name> - Generate new feature structure"
-	@echo "  make run            - Run the app"
-	@echo "  make build_runner   - Run build_runner once"
-	@echo "  make watch          - Run build_runner in watch mode"
-	@echo "  make get            - Get dependencies"
-	@echo "  make upgrade        - Upgrade dependencies"
-	@echo "  make outdated       - Check outdated packages"
-	@echo "  make analyze        - Analyze code"
-	@echo "  make format         - Format code"
-	@echo "  make test           - Run tests"
-	@echo "  make coverage       - Run tests with coverage"
-	@echo "  make doctor         - Run flutter doctor"
-	@echo "  make setup          - Initial project setup"
+	@echo "  make setup               - Initial project setup"
+	@echo "  make initialize_skills   - Initialize starter-pack skills"
+	@echo "  make install_skills      - Alias for initialize_skills"
+	@echo "  make code_gen            - Run build_runner code generation"
+	@echo "  make feature name=<name> - Create a feature folder scaffold"
+	@echo "  make clean               - Clean and reinstall dependencies"
+	@echo "  make get                 - Get dependencies"
+	@echo "  make upgrade             - Upgrade dependencies"
+	@echo "  make run                 - Run the app"
+	@echo "  make analyze             - Analyze code"
+	@echo "  make format              - Format code"
+	@echo "  make test                - Run tests"
+	@echo "  make coverage            - Run tests with coverage"
+	@echo "  make doctor              - Run flutter doctor"
 
-# Clean the project and get dependencies
 clean:
 	flutter clean
 	flutter pub get
 
-# Get dependencies
 get:
 	flutter pub get
 
-# Upgrade dependencies
 upgrade:
 	flutter pub upgrade
 
-# Check outdated packages
-outdated:
-	flutter pub outdated
-
-# Install the app on a connected device or emulator
-install:
-	flutter clean
-	flutter pub get
-	flutter build apk
-	flutter install apk
-
-# Create a release APK and open the folder containing the APK
-apk:
-	flutter clean
-	flutter pub get
-	flutter build apk --release
-	@echo "APK created successfully!"
-	open build/app/outputs/flutter-apk/ || xdg-open build/app/outputs/flutter-apk/ || start build/app/outputs/flutter-apk/
-
-# Create a debug APK with custom name and open folder
-apk_debug:
-	flutter clean
-	flutter pub get
-	flutter build apk --debug
-	mv build/app/outputs/flutter-apk/app-debug.apk build/app/outputs/flutter-apk/app_debug_mode.apk
-	@echo "Debug APK created successfully!"
-	open build/app/outputs/flutter-apk/ || xdg-open build/app/outputs/flutter-apk/ || start build/app/outputs/flutter-apk/
-
-# Run IPF generator file to generate models, services, repositories, etc.
-code_gen:
-	flutter test code_generator.dart
-
-# Run build_runner once
-build_runner:
-	flutter pub run build_runner build --delete-conflicting-outputs
-
-# Run build_runner in watch mode
-watch:
-	flutter pub run build_runner watch --delete-conflicting-outputs
-
-# Generate new feature with complete folder structure
-# Usage: make feature name=auth
-feature:
-ifndef name
-	@echo "Error: Please provide a feature name. Usage: make feature name=<feature_name>"
-	@exit 1
-endif
-	@echo "Creating feature: $(name)"
-	@mkdir -p lib/features/$(name)/controllers
-	@mkdir -p lib/features/$(name)/services
-	@mkdir -p lib/features/$(name)/models
-	@mkdir -p lib/features/$(name)/screens
-	@mkdir -p lib/features/$(name)/widgets
-	@echo "// Controllers for $(name) feature" > lib/features/$(name)/controllers/.gitkeep
-	@echo "// Services for $(name) feature" > lib/features/$(name)/services/.gitkeep
-	@echo "// Models for $(name) feature" > lib/features/$(name)/models/.gitkeep
-	@echo "// Screens for $(name) feature" > lib/features/$(name)/screens/.gitkeep
-	@echo "// Widgets for $(name) feature" > lib/features/$(name)/widgets/.gitkeep
-	@echo "Feature '$(name)' created successfully at lib/features/$(name)/"
-	@echo "Structure:"
-	@echo "  lib/features/$(name)/"
-	@echo "    ├── controllers/"
-	@echo "    ├── services/"
-	@echo "    ├── models/"
-	@echo "    ├── screens/"
-	@echo "    └── widgets/"
-
-# Run the app
 run:
 	flutter run
 
-# Analyze code
 analyze:
 	flutter analyze
 
-# Format code
 format:
 	dart format lib/ test/
 
-# Run tests
 test:
 	flutter test
 
-# Run tests with coverage
 coverage:
 	flutter test --coverage
-	@echo "Coverage report generated at coverage/lcov.info"
 
-# Run flutter doctor
 doctor:
 	flutter doctor -v
 
-# Initial project setup
+initialize_skills:
+	dart run ipf_flutter_starter_pack:initialize_skills || dart run ipf_flutter_starter_pack:install_skills
+
+install_skills: initialize_skills
+
+code_gen:
+	dart run build_runner build --delete-conflicting-outputs || \
+	  flutter pub run build_runner build --delete-conflicting-outputs
+
 setup:
 	flutter clean
 	flutter pub get
-	flutter pub run build_runner build --delete-conflicting-outputs
-	@echo "Project setup complete!"
+	@$(MAKE) initialize_skills
+
+feature:
+ifndef name
+	@echo "Error: provide a feature name. Usage: make feature name=<feature_name>"
+	@exit 1
+endif
+	@mkdir -p lib/features/$(name)/models lib/features/$(name)/providers lib/features/$(name)/screens lib/features/$(name)/services lib/features/$(name)/widgets
+	@echo "Created lib/features/$(name)/"
 MAKEFILE_EOF
 
-echo ""
-echo "Creating README..."
+# ─── Copy project-level assets ────────────────────────────────────────────────
 
-cat > README.md << 'README_EOF'
-# Flutter Project
+cp -R "$SCRIPT_DIR/commands/." .claude/commands/
+cp -R "$SCRIPT_DIR/skills/." .claude/skills/
+cp -R "$SCRIPT_DIR/widgets/." lib/shared/widgets/
 
-A Flutter project with a clean, organized architecture.
+# ─── Platform configuration ───────────────────────────────────────────────────
 
-## Project Structure
+log "Applying platform configuration..."
+python3 - "$GENERATED_IDENTIFIER" "$PACKAGE_NAME" "$DISPLAY_NAME" <<'PY'
+from pathlib import Path
+import re
+import sys
 
-```
-lib/
-├── core/
-│   ├── constants/      # App-wide constants
-│   ├── extensions/     # Dart extensions
-│   ├── mixins/         # Reusable mixins
-│   ├── resources/      # Resource files (fonts, images, svgs)
-│   ├── theme/          # App theming
-│   └── utils/          # Utility functions
-├── dao/                # Data Access Objects
-├── features/           # Feature modules
-├── l10n/               # Localization files
-├── root/               # Root level screens (splash, etc.)
-├── services/           # Global services
-└── shared/             # Shared components and controllers
-    ├── components/
-    └── controllers/
-```
+generated_identifier = sys.argv[1]
+package_name = sys.argv[2]
+display_name = sys.argv[3]
 
-## Getting Started
 
-### Prerequisites
+def patch_text(path: Path, transform):
+    if not path.exists():
+        return
+    original = path.read_text()
+    updated = transform(original)
+    if updated != original:
+        path.write_text(updated)
 
-- Flutter SDK (latest stable version)
-- Dart SDK
-- Android Studio / VS Code
-- Make (for using Makefile commands)
 
-### Setup
+pubspec = Path('pubspec.yaml')
+if pubspec.exists():
+    def transform_pubspec(text: str) -> str:
+        if 'assets/images/' not in text:
+            text = re.sub(
+                r'(flutter:\s*\n\s*uses-material-design:\s*true\s*)',
+                r'\1\n  assets:\n    - assets/images/\n    - assets/svgs/\n    - assets/fonts/\n    - .env\n',
+                text,
+                count=1,
+            )
+        return text
+    patch_text(pubspec, transform_pubspec)
 
-1. Clone the repository
-2. Run initial setup:
-   ```bash
-   make setup
-   ```
+manifest = Path('android/app/src/main/AndroidManifest.xml')
+if manifest.exists():
+    def transform_manifest(text: str) -> str:
+        if 'android.permission.INTERNET' not in text:
+            text = re.sub(
+                r'(<manifest[^>]*>)',
+                r'\1\n    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />',
+                text,
+                count=1,
+            )
+        return text.replace(generated_identifier, package_name)
+    patch_text(manifest, transform_manifest)
 
-## Available Make Commands
+strings_xml = Path('android/app/src/main/res/values/strings.xml')
+if strings_xml.exists():
+    def transform_strings(text: str) -> str:
+        if '<string name="app_name">' in text:
+            text = re.sub(
+                r'(<string name="app_name">)([^<]*)</string>',
+                rf'\1{display_name}</string>',
+                text,
+                count=1,
+            )
+        return text
+    patch_text(strings_xml, transform_strings)
 
-- `make help` - Show all available commands
-- `make clean` - Clean project and get dependencies
-- `make run` - Run the app
-- `make feature name=<name>` - Generate new feature structure
-- `make apk` - Build release APK
-- `make apk_debug` - Build debug APK
-- `make test` - Run tests
-- `make analyze` - Analyze code
-- `make format` - Format code
+for file_name in ('android/app/build.gradle', 'android/app/build.gradle.kts'):
+    path = Path(file_name)
+    if not path.exists():
+        continue
 
-### Creating a New Feature
+    def transform_gradle(text: str, _path=path) -> str:
+        text = text.replace(f'namespace = "{generated_identifier}"', f'namespace = "{package_name}"')
+        text = text.replace(f'applicationId = "{generated_identifier}"', f'applicationId = "{package_name}"')
+        text = text.replace(f'namespace "{generated_identifier}"', f'namespace "{package_name}"')
+        text = text.replace(f'applicationId "{generated_identifier}"', f'applicationId "{package_name}"')
+        if 'isCoreLibraryDesugaringEnabled = true' not in text and 'coreLibraryDesugaringEnabled true' not in text:
+            text = text.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+        if 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")' not in text and 'coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.4"' not in text:
+            text = text.replace('dependencies {', 'dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")', 1)
+        if str(_path) != 'android/app/build.gradle.kts' and 'isCoreLibraryDesugaringEnabled = true' in text:
+            text = text.replace('isCoreLibraryDesugaringEnabled = true', 'coreLibraryDesugaringEnabled true')
+        return text
 
-To create a new feature with the complete folder structure:
+    patch_text(path, transform_gradle)
 
-```bash
-make feature name=auth
-```
+plist = Path('ios/Runner/Info.plist')
+if plist.exists():
+    def transform_plist(text: str) -> str:
+        if '<key>CFBundleDisplayName</key>' in text:
+            text = re.sub(
+                r'(<key>CFBundleDisplayName</key>\s*<string>)([^<]*)</string>',
+                rf'\1{display_name}</string>',
+                text,
+                count=1,
+            )
+        else:
+            text = text.replace('<dict>', '<dict>\n\t<key>CFBundleDisplayName</key>\n\t<string>' + display_name + '</string>', 1)
+        if '<key>NSAppTransportSecurity</key>' not in text:
+            text = text.replace(
+                '<dict>',
+                '<dict>\n\t<key>NSAppTransportSecurity</key>\n\t<dict>\n\t\t<key>NSAllowsArbitraryLoads</key>\n\t\t<false/>\n\t</dict>',
+                1,
+            )
+        return text.replace(generated_identifier, package_name)
+    patch_text(plist, transform_plist)
+PY
 
-This will create:
-```
-lib/features/auth/
-├── controllers/
-├── services/
-├── models/
-├── screens/
-└── widgets/
-```
+# ─── auto_route code generation ───────────────────────────────────────────────
 
-## Development
+if [[ "$NAVIGATOR" == "auto_route" ]]; then
+  log "Generating auto_route route classes..."
+  run_build_runner
+fi
 
-Run the app in development mode:
-```bash
-make run
-```
+# ─── Android signing setup ────────────────────────────────────────────────────
 
-Run tests:
-```bash
-make test
-```
+if [[ "$APP_SIGNING" == "true" ]]; then
+  setup_android_signing "$KEY_ALIAS" "$KEY_PASSWORD" "$KEYSTORE_PASSWORD"
+fi
 
-Format code:
-```bash
-make format
-```
-
-## Building
-
-### Debug APK
-```bash
-make apk_debug
-```
-
-### Release APK
-```bash
-make apk
-```
-
-## Contributing
-
-1. Create a feature branch
-2. Make your changes
-3. Run `make format` and `make analyze`
-4. Submit a pull request
-
-## License
-
-Add your license here
-README_EOF
-
-echo ""
-echo "Creating code_generator.dart placeholder..."
-
-cat > code_generator.dart << EOF
-import 'package:flutter_pack/flutter_pack.dart';
-
-void main() {
-  List<BaseModelGenerator> generator = [
-
-  ];
-  CodeGenerator.of('$PROJECT_NAME', generator).generate();
-}
-EOF
-
-echo ""
-echo "=========================================="
-echo "✅ Project structure created successfully!"
-echo "=========================================="
-echo ""
-echo "Next steps:"
-echo "1. cd $PROJECT_NAME"
-echo "2. make setup"
-echo "3. make feature name=your_feature_name"
-echo "4. make run"
-echo ""
-echo "Use 'make help' to see all available commands"
+log ""
+log "=========================================="
+log "Project '$PROJECT_NAME' created successfully!"
+log "=========================================="
+log ""
+log "Next steps:"
+log "  cd $PROJECT_NAME"
+log "  make run"
+log "  make analyze"
